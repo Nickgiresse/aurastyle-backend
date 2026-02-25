@@ -125,11 +125,46 @@ router.delete("/products/:id", async (req: Request, res: Response): Promise<void
 // GET /api/admin/orders
 router.get("/orders", async (_req: Request, res: Response): Promise<void> => {
   try {
-    const orders = await Order.find().populate("user", "email").sort({ createdAt: -1 }).lean();
+    const orders = await Order.find()
+      .populate("user", "email firstName lastName")
+      .sort({ createdAt: -1 })
+      .lean();
     res.json(orders);
   } catch (error) {
     console.error("Erreur admin orders:", error);
     res.status(500).json({ message: "Erreur serveur." });
+  }
+});
+
+// DELETE /api/admin/orders/clear-all — avant /orders/:id pour éviter que "clear-all" soit pris comme id
+router.delete("/orders/clear-all", async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const result = await Order.deleteMany({});
+    res.json({
+      message: `${result.deletedCount} commande(s) supprimée(s)`,
+      deletedCount: result.deletedCount,
+    });
+  } catch (error: unknown) {
+    res.status(500).json({ message: (error as Error).message });
+  }
+});
+
+// DELETE /api/admin/orders/:id
+router.delete("/orders/:id", async (req: Request, res: Response): Promise<void> => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) {
+      res.status(404).json({ message: "Commande non trouvée." });
+      return;
+    }
+    const deletedTotal = order.total;
+    await Order.findByIdAndDelete(req.params.id);
+    res.json({
+      message: "Commande supprimée",
+      deletedTotal,
+    });
+  } catch (error: unknown) {
+    res.status(500).json({ message: (error as Error).message });
   }
 });
 
@@ -162,46 +197,46 @@ router.put("/orders/:id", async (req: Request, res: Response): Promise<void> => 
 // GET /api/admin/stats
 router.get("/stats", async (_req: Request, res: Response): Promise<void> => {
   try {
+    const totalProducts = await Product.countDocuments({ isActive: true });
+    const totalOrders = await Order.countDocuments();
+    const totalUsers = await User.countDocuments({ isAdmin: false });
+
+    const revenueResult = await Order.aggregate([
+      { $group: { _id: null, total: { $sum: "$total" } } },
+    ]);
+    const totalRevenue = revenueResult[0]?.total || 0;
+
     const sevenDaysAgo = new Date();
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-    sevenDaysAgo.setHours(0, 0, 0, 0);
 
-    const [totalProducts, totalOrders, totalUsers, allOrders, recentOrders] = await Promise.all([
-      Product.countDocuments(),
-      Order.countDocuments(),
-      User.countDocuments(),
-      Order.find({ createdAt: { $gte: sevenDaysAgo } }).select("total createdAt").lean(),
-      Order.find().populate("user", "email firstName lastName").sort({ createdAt: -1 }).limit(5).lean(),
+    const ordersByDayAgg = await Order.aggregate([
+      { $match: { createdAt: { $gte: sevenDaysAgo } } },
+      {
+        $group: {
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+          count: { $sum: 1 },
+          revenue: { $sum: "$total" },
+        },
+      },
+      { $sort: { _id: 1 } },
     ]);
-
-    const totalRevenue = (await Order.aggregate([{ $group: { _id: null, total: { $sum: "$total" } } }]))[0]?.total || 0;
-
-    const ordersByDayMap: Record<string, { count: number; revenue: number }> = {};
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date();
-      d.setDate(d.getDate() - i);
-      d.setHours(0, 0, 0, 0);
-      const key = d.toISOString().split("T")[0];
-      ordersByDayMap[key] = { count: 0, revenue: 0 };
-    }
-    for (const o of allOrders) {
-      const key = new Date(o.createdAt).toISOString().split("T")[0];
-      if (ordersByDayMap[key]) {
-        ordersByDayMap[key].count += 1;
-        ordersByDayMap[key].revenue += o.total || 0;
-      }
-    }
-    const ordersByDay = Object.entries(ordersByDayMap).map(([date, data]) => ({
-      date,
-      count: data.count,
-      revenue: data.revenue,
+    const ordersByDay = ordersByDayAgg.map((row) => ({
+      date: row._id,
+      count: row.count,
+      revenue: row.revenue,
     }));
+
+    const recentOrders = await Order.find()
+      .populate("user", "firstName lastName email")
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean();
 
     res.json({
       totalProducts,
       totalOrders,
-      totalUsers,
       totalRevenue,
+      totalUsers,
       recentOrders,
       ordersByDay,
     });
